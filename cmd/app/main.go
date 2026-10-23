@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
 	"example.com/linkup/internal/discovery"
+	"example.com/linkup/internal/interaction"
 	"example.com/linkup/internal/memory"
 )
 
@@ -27,4 +29,25 @@ func main() {
 	}
 
 	fmt.Printf("Recommendations for user %s: %v\n", targetUserID, recommendations)
+
+	interactionRepository := memory.NewInteractions()
+	interactionService := interaction.NewService(interactionRepository)
+	ctx := context.Background()
+	steps := []struct {
+		source, target string
+		action         interaction.Status
+	}{
+		{"u1", "u2", interaction.StatusPending},
+		{"u1", "u2", interaction.StatusPending},
+		{"u2", "u1", interaction.StatusPending},
+		{"u2", "u1", interaction.StatusPending},
+	}
+	for i, step := range steps {
+		result, err := interactionService.React(ctx, step.source, step.target, step.action)
+		if err != nil {
+			log.Fatalf("interaction step %d failed: %v", i+1, err)
+		}
+		fmt.Printf("Interaction step %d: changed=%t matched=%t state=%s/%s\n",
+			i+1, result.Changed, result.Matched, result.Reaction.SourceID, result.Reaction.Status)
+	}
 }
