@@ -12,6 +12,8 @@ var ErrInteractionStorageUnavailable = errors.New("interaction storage unavailab
 
 type interactionPair struct {
 	reactions map[string]interaction.Reaction
+	matched   bool
+	blockedBy string
 }
 
 type InteractionRepository struct {
@@ -30,33 +32,18 @@ func NewInteractions() *InteractionRepository {
 }
 
 func (r *InteractionRepository) Save(ctx context.Context, reaction interaction.Reaction) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if reaction.SourceID == "" || reaction.TargetID == "" || reaction.SourceID == reaction.TargetID {
-		return errors.New("invalid interaction participants")
-	}
 	if reaction.Status != interaction.StatusPending && reaction.Status != interaction.StatusAccepted {
 		return errors.New("invalid interaction status")
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if r.saveErr != nil {
-		return r.saveErr
-	}
-
-	key := makePairKey(reaction.SourceID, reaction.TargetID)
-	pair := r.pairs[key]
-	if pair.reactions == nil {
-		pair.reactions = make(map[string]interaction.Reaction)
-	}
-	pair.reactions[reaction.SourceID] = reaction
-	r.pairs[key] = pair
-	return nil
+	_, _, err := r.UpdatePair(ctx, reaction.SourceID, reaction.TargetID, func(pair interaction.Pair) (interaction.Pair, error) {
+		if pair.BlockedBy != "" {
+			return interaction.Pair{}, interaction.ErrPairBlocked
+		}
+		pair.Reaction = reaction
+		pair.Matched = pair.Reaction.Status == interaction.StatusPending && pair.Opposite.Status == interaction.StatusPending
+		return pair, nil
+	})
+	return err
 }
 
 func (r *InteractionRepository) Get(ctx context.Context, sourceID, targetID string) (interaction.Reaction, error) {
@@ -64,71 +51,82 @@ func (r *InteractionRepository) Get(ctx context.Context, sourceID, targetID stri
 		return interaction.Reaction{}, err
 	}
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	pair, ok := r.pairs[makePairKey(sourceID, targetID)]
-	if !ok {
+	pair, err := r.ReadPair(ctx, sourceID, targetID)
+	if err != nil {
+		return interaction.Reaction{}, err
+	}
+	if pair.Reaction.Status == interaction.StatusNone {
 		return interaction.Reaction{}, interaction.ErrInteractionNotFound
 	}
-	reaction, ok := pair.reactions[sourceID]
-	if !ok {
-		return interaction.Reaction{}, interaction.ErrInteractionNotFound
-	}
-	return reaction, nil
+	return pair.Reaction, nil
 }
 
 func (r *InteractionRepository) GetPair(ctx context.Context, sourceID, targetID string) (interaction.Reaction, interaction.Reaction, error) {
+	pair, err := r.ReadPair(ctx, sourceID, targetID)
+	return pair.Reaction, pair.Opposite, err
+}
+
+func (r *InteractionRepository) ReadPair(ctx context.Context, sourceID, targetID string) (interaction.Pair, error) {
 	if err := ctx.Err(); err != nil {
-		return interaction.Reaction{}, interaction.Reaction{}, err
+		return interaction.Pair{}, err
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	pair := r.pairs[makePairKey(sourceID, targetID)]
-	return reactionOrNone(pair, sourceID, targetID), reactionOrNone(pair, targetID, sourceID), nil
+	stored := r.pairs[makePairKey(sourceID, targetID)]
+	return pairState(stored, sourceID, targetID), nil
 }
 
 func (r *InteractionRepository) UpdatePair(
 	ctx context.Context,
 	sourceID, targetID string,
-	update func(interaction.Reaction, interaction.Reaction) (interaction.Reaction, bool, error),
-) (interaction.Reaction, interaction.Reaction, bool, error) {
+	update func(interaction.Pair) (interaction.Pair, error),
+) (interaction.Pair, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return interaction.Reaction{}, interaction.Reaction{}, false, err
+		return interaction.Pair{}, false, err
 	}
 	if sourceID == "" || targetID == "" || sourceID == targetID {
-		return interaction.Reaction{}, interaction.Reaction{}, false, errors.New("invalid interaction participants")
+		return interaction.Pair{}, false, errors.New("invalid interaction participants")
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return interaction.Reaction{}, interaction.Reaction{}, false, err
+		return interaction.Pair{}, false, err
 	}
 
 	key := makePairKey(sourceID, targetID)
-	pair := r.pairs[key]
-	current := reactionOrNone(pair, sourceID, targetID)
-	opposite := reactionOrNone(pair, targetID, sourceID)
-	next, changed, err := update(current, opposite)
+	stored := r.pairs[key]
+	current := pairState(stored, sourceID, targetID)
+	next, err := update(current)
 	if err != nil {
-		return interaction.Reaction{}, interaction.Reaction{}, false, err
+		return interaction.Pair{}, false, err
 	}
-	if !changed {
-		return current, opposite, false, nil
+	if !validPair(next, sourceID, targetID) {
+		return interaction.Pair{}, false, errors.New("invalid interaction pair update")
 	}
-	if next.SourceID != sourceID || next.TargetID != targetID ||
-		(next.Status != interaction.StatusPending && next.Status != interaction.StatusAccepted) {
-		return interaction.Reaction{}, interaction.Reaction{}, false, errors.New("invalid interaction update")
+	if equalPair(current, next) {
+		return current, false, nil
 	}
 	if r.saveErr != nil {
-		return interaction.Reaction{}, interaction.Reaction{}, false, r.saveErr
+		return interaction.Pair{}, false, r.saveErr
 	}
-	if pair.reactions == nil {
-		pair.reactions = make(map[string]interaction.Reaction)
+	if stored.reactions == nil {
+		stored.reactions = make(map[string]interaction.Reaction)
 	}
-	pair.reactions[sourceID] = next
-	r.pairs[key] = pair
-	return next, opposite, true, nil
+	if next.Reaction.Status == interaction.StatusNone {
+		delete(stored.reactions, sourceID)
+	} else {
+		stored.reactions[sourceID] = next.Reaction
+	}
+	if next.Opposite.Status == interaction.StatusNone {
+		delete(stored.reactions, targetID)
+	} else {
+		stored.reactions[targetID] = next.Opposite
+	}
+	stored.matched = next.Matched
+	stored.blockedBy = next.BlockedBy
+	r.pairs[key] = stored
+	return next, true, nil
 }
 
 func (r *InteractionRepository) SetSaveError(err error) {
@@ -137,11 +135,38 @@ func (r *InteractionRepository) SetSaveError(err error) {
 	r.saveErr = err
 }
 
+func pairState(stored interactionPair, sourceID, targetID string) interaction.Pair {
+	return interaction.Pair{
+		Reaction:  reactionOrNone(stored, sourceID, targetID),
+		Opposite:  reactionOrNone(stored, targetID, sourceID),
+		Matched:   stored.matched,
+		BlockedBy: stored.blockedBy,
+	}
+}
+
 func reactionOrNone(pair interactionPair, sourceID, targetID string) interaction.Reaction {
 	if reaction, ok := pair.reactions[sourceID]; ok {
 		return reaction
 	}
 	return interaction.Reaction{SourceID: sourceID, TargetID: targetID, Status: interaction.StatusNone}
+}
+
+func validPair(pair interaction.Pair, sourceID, targetID string) bool {
+	return pair.Reaction.SourceID == sourceID && pair.Reaction.TargetID == targetID &&
+		pair.Opposite.SourceID == targetID && pair.Opposite.TargetID == sourceID &&
+		validStatus(pair.Reaction.Status) && validStatus(pair.Opposite.Status) &&
+		(pair.BlockedBy == "" || pair.BlockedBy == sourceID || pair.BlockedBy == targetID) &&
+		(!pair.Matched || (pair.BlockedBy == "" &&
+			pair.Reaction.Status == interaction.StatusPending && pair.Opposite.Status == interaction.StatusPending))
+}
+
+func validStatus(status interaction.Status) bool {
+	return status == interaction.StatusNone || status == interaction.StatusPending || status == interaction.StatusAccepted
+}
+
+func equalPair(left, right interaction.Pair) bool {
+	return left.Reaction == right.Reaction && left.Opposite == right.Opposite &&
+		left.Matched == right.Matched && left.BlockedBy == right.BlockedBy
 }
 
 func makePairKey(sourceID, targetID string) pairKey {

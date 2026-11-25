@@ -18,7 +18,7 @@ import (
 	"example.com/linkup/internal/demo"
 	"example.com/linkup/internal/httpapi"
 	"example.com/linkup/internal/interaction"
-	"example.com/linkup/internal/memory"
+	"example.com/linkup/internal/postgres"
 	"example.com/linkup/internal/profileapi"
 )
 
@@ -29,9 +29,10 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (result error) {
 	appAddr := env("APP_ADDR", ":8080")
 	profileURL := env("PROFILE_API_URL", "http://127.0.0.1:8081")
+	databaseURL := env("DATABASE_URL", "postgres://linkup:linkup@localhost:5432/linkup?sslmode=disable")
 	commandBudget, err := positiveMillis("COMMAND_BUDGET_MS", "900")
 	if err != nil {
 		return err
@@ -48,15 +49,43 @@ func run() error {
 	if err != nil || maxResponseBytes < 128 || maxResponseBytes > 1<<20 {
 		return errors.New("PROFILE_RESPONSE_LIMIT_BYTES must be between 128 and 1048576")
 	}
+	databaseTimeout, err := positiveMillis("DB_QUERY_TIMEOUT_MS", "700")
+	if err != nil {
+		return err
+	}
+	lockTimeout, err := positiveMillis("DB_LOCK_TIMEOUT_MS", "400")
+	if err != nil {
+		return err
+	}
+	maxConnections, err := strconv.Atoi(env("DB_MAX_OPEN_CONNS", "10"))
+	if err != nil || maxConnections < 2 || maxConnections > 100 {
+		return errors.New("DB_MAX_OPEN_CONNS must be between 2 and 100")
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	profiles := memory.NewProfiles(demo.Profiles())
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), databaseTimeout)
+	defer cancelStartup()
+	store, err := postgres.Open(startupContext, databaseURL, maxConnections, databaseTimeout, lockTimeout)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("close PostgreSQL pool: %w", err))
+		}
+	}()
+	if err := store.Migrate(startupContext); err != nil {
+		return err
+	}
+	if err := store.SeedProfiles(startupContext, demo.Profiles()); err != nil {
+		return err
+	}
 	profileClient, err := profileapi.NewClient(profileURL, &http.Client{Timeout: clientTimeout, Transport: http.DefaultTransport}, maxResponseBytes)
 	if err != nil {
 		return err
 	}
-	interactions := interaction.NewService(memory.NewInteractions(), profileClient)
-	api, err := httpapi.New(profiles, interactions, commandBudget, logger)
+	interactions := interaction.NewService(store, profileClient)
+	api, err := httpapi.New(store, interactions, commandBudget, logger)
 	if err != nil {
 		return err
 	}

@@ -19,7 +19,15 @@ type Result struct {
 	Opposite   Reaction
 	Matched    bool
 	MatchedNow bool
+	Blocked    bool
 	Changed    bool
+}
+
+type Pair struct {
+	Reaction  Reaction
+	Opposite  Reaction
+	Matched   bool
+	BlockedBy string
 }
 
 type Participant struct {

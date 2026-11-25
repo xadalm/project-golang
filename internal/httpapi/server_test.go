@@ -188,6 +188,80 @@ func TestHealthHasRequestIDWithoutDemoIdentity(t *testing.T) {
 	}
 }
 
+func TestProfileEditUsesOwnerAndExpectedVersion(t *testing.T) {
+	api, _ := newTestServer(t)
+	handler := api.Handler()
+	initial := request(t, handler, http.MethodGet, "/v1/profiles/u1", "u1")
+	var profile profileResponseDTO
+	if err := json.Unmarshal(initial.Body.Bytes(), &profile); err != nil {
+		t.Fatal(err)
+	}
+	if initial.Code != http.StatusOK || profile.Version != 1 {
+		t.Fatalf("initial profile: %d %s", initial.Code, initial.Body)
+	}
+
+	update := func(actor, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/v1/profiles/u1", strings.NewReader(body))
+		req.Header.Set("X-Demo-User", actor)
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	first := update("u1", `{"expected_version":1,"interests":["go","distributed-systems"]}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("profile update: %d %s", first.Code, first.Body)
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile.Version != 2 || len(profile.Interests) != 2 {
+		t.Fatalf("updated profile: %#v", profile)
+	}
+	stale := update("u1", `{"expected_version":1,"interests":["stale"]}`)
+	if stale.Code != http.StatusConflict || !strings.Contains(stale.Body.String(), "version_conflict") {
+		t.Fatalf("stale edit: %d %s", stale.Code, stale.Body)
+	}
+	forbidden := update("u2", `{"expected_version":2,"interests":["unauthorized"]}`)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("foreign edit: %d %s", forbidden.Code, forbidden.Body)
+	}
+	missing := httptest.NewRequest(http.MethodPut, "/v1/profiles/u9", strings.NewReader(`{"expected_version":1,"interests":[]}`))
+	missing.Header.Set("X-Demo-User", "u1")
+	missing.Header.Set("Content-Type", "application/json")
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusNotFound {
+		t.Fatalf("missing profile update: %d %s", missingResponse.Code, missingResponse.Body)
+	}
+	check := request(t, handler, http.MethodGet, "/v1/profiles/u1", "u1")
+	if err := json.Unmarshal(check.Body.Bytes(), &profile); err != nil {
+		t.Fatal(err)
+	}
+	if check.Code != http.StatusOK || profile.Version != 2 || profile.Interests[1] != "distributed-systems" {
+		t.Fatalf("profile changed after failed edits: %d %#v", check.Code, profile)
+	}
+}
+
+func TestBlockRouteDeactivatesPairAndPreventsNewLike(t *testing.T) {
+	api, _ := newTestServer(t)
+	handler := api.Handler()
+	request(t, handler, http.MethodPut, "/v1/me/likes/u2", "u1")
+	request(t, handler, http.MethodPut, "/v1/me/likes/u1", "u2")
+	block := request(t, handler, http.MethodPut, "/v1/me/blocks/u2", "u1")
+	var blocked pairResponse
+	if err := json.Unmarshal(block.Body.Bytes(), &blocked); err != nil {
+		t.Fatal(err)
+	}
+	if block.Code != http.StatusOK || !blocked.Blocked || blocked.Matched {
+		t.Fatalf("block result: %d %s", block.Code, block.Body)
+	}
+	like := request(t, handler, http.MethodPut, "/v1/me/likes/u1", "u2")
+	if like.Code != http.StatusConflict || !strings.Contains(like.Body.String(), "user_blocked") {
+		t.Fatalf("like after block: %d %s", like.Code, like.Body)
+	}
+}
+
 func TestDependencyFailuresMapToGatewayStatuses(t *testing.T) {
 	tests := []struct {
 		name string

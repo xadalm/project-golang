@@ -47,6 +47,32 @@ X-Demo-User: u2
 GET {{app}}/v1/me/pairs/u2
 X-Demo-User: u1
 
+### Current profile and version (200)
+GET {{app}}/v1/profiles/u1
+X-Demo-User: u1
+
+### Update own profile with optimistic version (200; version increments)
+PUT {{app}}/v1/profiles/u1
+X-Demo-User: u1
+Content-Type: application/json
+
+{"expected_version":1,"interests":["go","systems"]}
+
+### Stale profile version (409)
+PUT {{app}}/v1/profiles/u1
+X-Demo-User: u1
+Content-Type: application/json
+
+{"expected_version":1,"interests":["go","music"]}
+
+### Block a pair (200; blocked=true, matched=false)
+PUT {{app}}/v1/me/blocks/u2
+X-Demo-User: u1
+
+### Like after block (409; user_blocked)
+PUT {{app}}/v1/me/likes/u2
+X-Demo-User: u1
+
 ### Restore dependency to ok before each failure scenario
 PUT {{profiles}}/_admin/mode
 Content-Type: application/json

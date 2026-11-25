@@ -93,8 +93,12 @@ type failedPairReadRepository struct {
 	err error
 }
 
-func (r failedPairReadRepository) UpdatePair(context.Context, string, string, func(interaction.Reaction, interaction.Reaction) (interaction.Reaction, bool, error)) (interaction.Reaction, interaction.Reaction, bool, error) {
-	return interaction.Reaction{}, interaction.Reaction{}, false, r.err
+func (r failedPairReadRepository) ReadPair(context.Context, string, string) (interaction.Pair, error) {
+	return interaction.Pair{}, r.err
+}
+
+func (r failedPairReadRepository) UpdatePair(context.Context, string, string, func(interaction.Pair) (interaction.Pair, error)) (interaction.Pair, bool, error) {
+	return interaction.Pair{}, false, r.err
 }
 
 func TestConcurrentOppositeLikesCreateOneMatch(t *testing.T) {
@@ -128,5 +132,31 @@ func TestConcurrentOppositeLikesCreateOneMatch(t *testing.T) {
 	state, err := service.Inspect(context.Background(), "u1", "u2")
 	if err != nil || !state.Matched {
 		t.Fatalf("final pair state: %#v, %v", state, err)
+	}
+}
+
+func TestBlockDeactivatesMatchAndRejectsFutureReactions(t *testing.T) {
+	repository := memory.NewInteractions()
+	service := interaction.NewService(repository, nil)
+	if _, err := service.React(context.Background(), "u1", "u2", interaction.StatusPending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.React(context.Background(), "u2", "u1", interaction.StatusPending); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := service.Block(context.Background(), "u1", "u2")
+	if err != nil || !blocked.Changed || !blocked.Blocked || blocked.Matched {
+		t.Fatalf("block result: %#v, %v", blocked, err)
+	}
+	repeated, err := service.Block(context.Background(), "u1", "u2")
+	if err != nil || repeated.Changed || !repeated.Blocked {
+		t.Fatalf("block repeat: %#v, %v", repeated, err)
+	}
+	if _, err := service.React(context.Background(), "u2", "u1", interaction.StatusPending); !errors.Is(err, interaction.ErrPairBlocked) {
+		t.Fatalf("reaction after block returned %v", err)
+	}
+	state, err := service.Inspect(context.Background(), "u2", "u1")
+	if err != nil || !state.Blocked || state.Matched || state.Reaction.Status != interaction.StatusPending {
+		t.Fatalf("unexpected state after block: %#v, %v", state, err)
 	}
 }
