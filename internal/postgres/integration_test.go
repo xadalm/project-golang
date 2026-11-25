@@ -113,8 +113,7 @@ func TestPostgresAtomicMatchAndRollback(t *testing.T) {
 	if _, err := service.React(ctx, "u1", "u3", interaction.StatusPending); err != nil {
 		t.Fatalf("seed first reaction for rollback test: %v", err)
 	}
-	if _, err := fixture.admin.ExecContext(ctx, `
-		CREATE FUNCTION fail_match_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+	if _, err := fixture.admin.ExecContext(ctx, `CREATE FUNCTION `+fixture.schema+`.fail_match_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			RAISE EXCEPTION 'injected transaction failure' USING ERRCODE = 'P0001';
 		END; $$`); err != nil {
@@ -153,12 +152,11 @@ func TestPostgresBlockAndLikeSerializeInBothOrders(t *testing.T) {
 		t.Fatalf("seed pending reaction: %v", err)
 	}
 	reactionLock := time.Now().UnixNano()
-	if _, err := fixture.admin.ExecContext(ctx, fmt.Sprintf(`
-		CREATE FUNCTION wait_on_reaction() RETURNS trigger LANGUAGE plpgsql AS $$
+	if _, err := fixture.admin.ExecContext(ctx, fmt.Sprintf(`CREATE FUNCTION %s.wait_on_reaction() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			PERFORM pg_advisory_xact_lock(%d);
 			RETURN NEW;
-		END; $$`, reactionLock)); err != nil {
+		END; $$`, fixture.schema, reactionLock)); err != nil {
 		t.Fatalf("create reaction barrier function: %v", err)
 	}
 	if _, err := fixture.admin.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER wait_on_reaction BEFORE INSERT ON %s.reactions
@@ -178,7 +176,7 @@ func TestPostgresBlockAndLikeSerializeInBothOrders(t *testing.T) {
 		_, err := service.React(ctx, "u1", "u2", interaction.StatusPending)
 		likeDone <- err
 	}()
-	waitForActivity(t, ctx, fixture, "%pg_advisory_xact_lock%")
+	waitForActivity(t, ctx, fixture, "%INSERT INTO reactions%")
 
 	blockDone := make(chan error, 1)
 	go func() {
@@ -210,12 +208,11 @@ func TestPostgresBlockAndLikeSerializeInBothOrders(t *testing.T) {
 		t.Fatalf("create pair lock row for block-first case: %v", err)
 	}
 	blockLock := time.Now().UnixNano()
-	if _, err := fixture.admin.ExecContext(ctx, fmt.Sprintf(`
-		CREATE FUNCTION wait_on_block() RETURNS trigger LANGUAGE plpgsql AS $$
+	if _, err := fixture.admin.ExecContext(ctx, fmt.Sprintf(`CREATE FUNCTION %s.wait_on_block() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			PERFORM pg_advisory_xact_lock(%d);
 			RETURN NEW;
-		END; $$`, blockLock)); err != nil {
+		END; $$`, fixture.schema, blockLock)); err != nil {
 		t.Fatalf("create block barrier function: %v", err)
 	}
 	if _, err := fixture.admin.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER wait_on_block BEFORE UPDATE OF blocked_by ON %s.interaction_pairs
@@ -230,7 +227,7 @@ func TestPostgresBlockAndLikeSerializeInBothOrders(t *testing.T) {
 		_, err := service.Block(ctx, "u3", "u4")
 		blockDone <- err
 	}()
-	waitForActivity(t, ctx, fixture, "%pg_advisory_xact_lock%")
+	waitForActivity(t, ctx, fixture, "%UPDATE interaction_pairs%")
 	likeDone = make(chan error, 1)
 	go func() {
 		_, err := service.React(ctx, "u3", "u4", interaction.StatusPending)
