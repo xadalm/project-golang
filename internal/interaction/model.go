@@ -15,8 +15,14 @@ type Reaction struct {
 }
 
 type Result struct {
-	Reaction Reaction
-	Opposite Reaction
-	Matched  bool
-	Changed  bool
+	Reaction   Reaction
+	Opposite   Reaction
+	Matched    bool
+	MatchedNow bool
+	Changed    bool
+}
+
+type Participant struct {
+	ID     string
+	Active bool
 }

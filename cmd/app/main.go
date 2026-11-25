@@ -2,52 +2,121 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
-	"example.com/linkup/internal/discovery"
+	"example.com/linkup/internal/demo"
+	"example.com/linkup/internal/httpapi"
 	"example.com/linkup/internal/interaction"
 	"example.com/linkup/internal/memory"
+	"example.com/linkup/internal/profileapi"
 )
 
 func main() {
-	fixtures := []discovery.Profile{
-		{ID: "u1", Active: true, Interests: []string{"go", "backend"}},
-		{ID: "u2", Active: true, Interests: []string{"go", "music"}},
-		{ID: "u3", Active: false, Interests: []string{"go"}},
-		{ID: "u4", Active: true, Interests: []string{"backend", "art"}},
-		{ID: "u5", Active: true, Interests: []string{"python"}},
+	if err := run(); err != nil {
+		log.Printf("application failed: %v", err)
+		os.Exit(1)
 	}
+}
 
-	repo := memory.NewProfiles(fixtures)
-	service := discovery.NewService(repo)
-
-	targetUserID := "u1"
-	recommendations, err := discovery.Recommend(service, targetUserID)
+func run() error {
+	appAddr := env("APP_ADDR", ":8080")
+	profileURL := env("PROFILE_API_URL", "http://127.0.0.1:8081")
+	commandBudget, err := positiveMillis("COMMAND_BUDGET_MS", "900")
 	if err != nil {
-		log.Fatalf("Error getting recommendations: %v", err)
+		return err
+	}
+	clientTimeout, err := positiveMillis("PROFILE_HTTP_TIMEOUT_MS", "700")
+	if err != nil {
+		return err
+	}
+	shutdownGrace, err := positiveMillis("SHUTDOWN_GRACE_MS", "5000")
+	if err != nil {
+		return err
+	}
+	maxResponseBytes, err := strconv.Atoi(env("PROFILE_RESPONSE_LIMIT_BYTES", "4096"))
+	if err != nil || maxResponseBytes < 128 || maxResponseBytes > 1<<20 {
+		return errors.New("PROFILE_RESPONSE_LIMIT_BYTES must be between 128 and 1048576")
 	}
 
-	fmt.Printf("Recommendations for user %s: %v\n", targetUserID, recommendations)
-
-	interactionRepository := memory.NewInteractions()
-	interactionService := interaction.NewService(interactionRepository)
-	ctx := context.Background()
-	steps := []struct {
-		source, target string
-		action         interaction.Status
-	}{
-		{"u1", "u2", interaction.StatusPending},
-		{"u1", "u2", interaction.StatusPending},
-		{"u2", "u1", interaction.StatusPending},
-		{"u2", "u1", interaction.StatusPending},
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	profiles := memory.NewProfiles(demo.Profiles())
+	profileClient, err := profileapi.NewClient(profileURL, &http.Client{Timeout: clientTimeout, Transport: http.DefaultTransport}, maxResponseBytes)
+	if err != nil {
+		return err
 	}
-	for i, step := range steps {
-		result, err := interactionService.React(ctx, step.source, step.target, step.action)
-		if err != nil {
-			log.Fatalf("interaction step %d failed: %v", i+1, err)
+	interactions := interaction.NewService(memory.NewInteractions(), profileClient)
+	api, err := httpapi.New(profiles, interactions, commandBudget, logger)
+	if err != nil {
+		return err
+	}
+	server := &http.Server{
+		Addr:              appAddr,
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      commandBudget + 2*time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	listener, err := net.Listen("tcp", appAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", appAddr, err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serverErrors := make(chan error, 1)
+	go func() {
+		logger.Info("application listening", "address", appAddr, "profile_api", profileURL)
+		serverErrors <- server.Serve(listener)
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve HTTP: %w", err)
 		}
-		fmt.Printf("Interaction step %d: changed=%t matched=%t state=%s/%s\n",
-			i+1, result.Changed, result.Matched, result.Reaction.SourceID, result.Reaction.Status)
+		return nil
+	case <-ctx.Done():
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		closeErr := server.Close()
+		if closeErr != nil {
+			return fmt.Errorf("shutdown server: %v; force close: %w", err, closeErr)
+		}
+		return fmt.Errorf("shutdown server: %w", err)
+	}
+	if err := <-serverErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve HTTP: %w", err)
+	}
+	return nil
+}
+
+func positiveMillis(name, fallback string) (time.Duration, error) {
+	value, err := strconv.Atoi(env(name, fallback))
+	if err != nil || value <= 0 || value > 24*60*60*1000 {
+		return 0, fmt.Errorf("%s must be between 1 and 86400000 milliseconds", name)
+	}
+	return time.Duration(value) * time.Millisecond, nil
+}
+
+func env(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
 }

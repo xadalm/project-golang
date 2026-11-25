@@ -1,0 +1,104 @@
+@app = http://localhost:8080
+@profiles = http://127.0.0.1:8081
+
+### Health (200)
+GET {{app}}/healthz
+
+### Discovery, first page (200; u2, u5)
+GET {{app}}/v1/me/discovery?interest=go&limit=2&offset=0
+X-Demo-User: u1
+
+### Discovery, second page (200; u6)
+GET {{app}}/v1/me/discovery?interest=go&limit=2&offset=2
+X-Demo-User: u1
+
+### Empty page (200; items: [])
+GET {{app}}/v1/me/discovery?interest=not-found&limit=2
+X-Demo-User: u1
+
+### Bad query (400)
+GET {{app}}/v1/me/discovery?interest=go&limit=51
+X-Demo-User: u1
+
+### Missing demo identity (400)
+GET {{app}}/v1/me/discovery?interest=go
+
+### Initial pair state (200; status=none, matched=false)
+GET {{app}}/v1/me/pairs/u2
+X-Demo-User: u1
+
+### First Like (200; changed=true)
+PUT {{app}}/v1/me/likes/u2
+X-Demo-User: u1
+
+### Repeated Like (200; changed=false)
+PUT {{app}}/v1/me/likes/u2
+X-Demo-User: u1
+
+### Pair after first Like (200; matched=false)
+GET {{app}}/v1/me/pairs/u2
+X-Demo-User: u1
+
+### Reciprocal Like (200; matched_now=true)
+PUT {{app}}/v1/me/likes/u1
+X-Demo-User: u2
+
+### Pair after reciprocal Like (200; matched=true)
+GET {{app}}/v1/me/pairs/u2
+X-Demo-User: u1
+
+### Restore dependency to ok before each failure scenario
+PUT {{profiles}}/_admin/mode
+Content-Type: application/json
+
+{"mode":"ok"}
+
+### missing: next fresh Like returns 404, no state saved
+PUT {{profiles}}/_admin/mode
+Content-Type: application/json
+
+{"mode":"missing"}
+
+###
+PUT {{app}}/v1/me/likes/u4
+X-Demo-User: u1
+
+### error: next fresh Like returns 502, no state saved
+PUT {{profiles}}/_admin/mode
+Content-Type: application/json
+
+{"mode":"error"}
+
+###
+PUT {{app}}/v1/me/likes/u5
+X-Demo-User: u1
+
+### slow: next fresh Like returns 504, no state saved
+PUT {{profiles}}/_admin/mode
+Content-Type: application/json
+
+{"mode":"slow"}
+
+###
+PUT {{app}}/v1/me/likes/u6
+X-Demo-User: u1
+
+### large: next fresh Like returns 502, no state saved
+PUT {{profiles}}/_admin/mode
+Content-Type: application/json
+
+{"mode":"large"}
+
+###
+PUT {{app}}/v1/me/likes/u4
+X-Demo-User: u1
+
+### Restore normal operation
+PUT {{profiles}}/_admin/mode
+Content-Type: application/json
+
+{"mode":"ok"}
+
+### u1/u4 request succeeds after recovery (200)
+PUT {{app}}/v1/me/likes/u4
+X-Demo-User: u1
